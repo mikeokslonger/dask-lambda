@@ -1051,6 +1051,8 @@ class Worker(WorkerBase):
     """
 
     def __init__(self, *args, **kwargs):
+        print('args into worker: {}'.format(args))
+        print('kwargs into worker: {}'.format(kwargs))
         self.tasks = dict()
         self.task_state = dict()
         self.dep_state = dict()
@@ -2673,6 +2675,59 @@ class Reschedule(Exception):
     """
     pass
 
+
+class LambdaWorker(Worker):
+    @gen.coroutine
+    def _register_with_scheduler(self):
+        self.periodic_callbacks['heartbeat'].stop()
+        start = time()
+        if self.contact_address is None:
+            self.contact_address = 'tcp://localhost:' + str(self.port)
+        logger.info('-' * 49)
+        while True:
+            if self.death_timeout and time() > start + self.death_timeout:
+                yield self._close(timeout=1)
+                return
+            if self.status in ('closed', 'closing'):
+                raise gen.Return
+            try:
+                _start = time()
+                future = self.scheduler.register(
+                        ncores=self.ncores,
+                        address=self.contact_address,
+                        keys=list(self.data),
+                        name=self.name,
+                        nbytes=self.nbytes,
+                        now=time(),
+                        services=self.service_ports,
+                        memory_limit=self.memory_limit,
+                        local_directory=self.local_dir,
+                        resources=self.total_resources,
+                        pid=os.getpid(),
+                        **self.monitor.recent())
+                if self.death_timeout:
+                    diff = self.death_timeout - (time() - start)
+                    if diff < 0:
+                        continue
+                    future = gen.with_timeout(timedelta(seconds=diff), future)
+                response = yield future
+                _end = time()
+                middle = (_start + _end) / 2
+                self.scheduler_delay = response['time'] - middle
+                self.status = 'running'
+                break
+            except EnvironmentError:
+                logger.info('Waiting to connect to: %26s', self.scheduler.address)
+                yield gen.sleep(0.1)
+            except gen.TimeoutError:
+                logger.info("Timed out when connecting to scheduler")
+        if response['status'] != 'OK':
+            raise ValueError("Unexpected response from register: %r" %
+                             (response,))
+        else:
+            logger.info('        Registered to: %26s', self.scheduler.address)
+            logger.info('-' * 49)
+        self.periodic_callbacks['heartbeat'].start()
 
 def parse_memory_limit(memory_limit, ncores):
     if memory_limit is None:

@@ -1,4 +1,8 @@
 from distributed import Worker
+from distributed.cli import dask_worker
+from distributed.worker import LambdaWorker
+from tornado.ioloop import IOLoop
+from tornado import gen
 import threading
 import paramiko
 import socket
@@ -11,6 +15,7 @@ s3 = boto3.resource('s3')
 
 
 def handler(chan, host, port):
+    print('Running handler')
     sock = socket.socket()
     try:
         sock.connect((host, port))
@@ -43,9 +48,10 @@ def reverse_forward_tunnel(server_port, remote_host, remote_port, transport):
         chan = transport.accept(1000)
         if chan is None:
             continue
-        thr = threading.Thread(target=handler, args=(chan, remote_host, remote_port))
-        thr.setDaemon(True)
-        thr.start()
+        handler(chan, remote_host, remote_port)
+        #thr = threading.Thread(target=handler, args=(chan, remote_host, remote_port))
+        #thr.setDaemon(True)
+        #thr.start()
 
 
 def forward(user, ssh_key, remote_url, remote_port, local_port):
@@ -56,12 +62,15 @@ def forward(user, ssh_key, remote_url, remote_port, local_port):
     t = threading.Thread(target=reverse_forward_tunnel, args=(remote_port, 'localhost', local_port, client.get_transport()))
     t.setDaemon(True)
     t.start()
+    return t
 
 
 def run(event, context):
     print('Starting')
     scheduler_ip = event['ip']
     scheduler_port = event['port']
+    worker_remote_port = event['worker_remote_port']
+
     user = event['user']
     ssh_key = event['ssh_key']
     new_cert_location = '/tmp/cert.pem'
@@ -73,20 +82,50 @@ def run(event, context):
     print('Changing file permissions on cert')
     os.chmod(new_cert_location, 400)
 
+
     scheduler_addr = '{}:{}'.format(scheduler_ip, scheduler_port)
     print('Starting worker connecting to scheduler at: {}'.format(scheduler_addr))
 
+    # Registering tcp://169...., tcp://172...., tcp://172....
+    #dask_worker.main.main(['tcp://' + scheduler_addr, '--no-nanny',
+    #                       '--local-directory', '/tmp/',
+    #                       '--listen-address', 'tcp://0.0.0.0',
+    #                       '--contact-address', '',
+    #                       ])
 
     print('Starting dask worker')
-    w = Worker('tcp://' + scheduler_addr, local_dir='/tmp/')
-    w._start('localhost')
+    loop = IOLoop.current()
+    w = LambdaWorker('tcp://' + scheduler_addr, local_dir='/tmp/', loop=loop, contact_address=None, name='')
+
+    def run_worker(w):
+        @gen.coroutine
+        def run():
+            yield w._start(None)
+            while w.status != 'closed':
+                yield gen.sleep(0.2)
+
+        w._start(None)
+
+        try:
+            loop.run_sync(run)
+        except (KeyboardInterrupt, TimeoutError):
+            pass
+        finally:
+            print("End worker")
+
+    import threading
+    t = threading.Thread(target=run_worker, args=(w,))
+    t.setDaemon(True)
+    t.start()
 
     import time
-    time.sleep(5)
+    time.sleep(1)
+
 
     print('Starting forwarding')
-    forward(user, new_cert_location, scheduler_ip, remote_port=w.port, local_port=w.port)
+    t = forward(user, new_cert_location, scheduler_ip, remote_port=worker_remote_port, local_port=w.port)
 
+    import time
     time.sleep(10)
 
     print('Returning')
